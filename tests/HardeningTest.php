@@ -85,4 +85,121 @@ class HardeningTest extends TestCase {
 		$this->assertNotContains( 'exec', $still );
 		$this->assertNotContains( 'system', $still );
 	}
+
+	// ---- duplicate_salt_names -------------------------------------------
+
+	public function test_no_duplicates_among_distinct_salts() {
+		$salts = array(
+			'AUTH_KEY'   => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			'AUTH_SALT'  => 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+		);
+		$this->assertSame( array(), IS_Hardening::duplicate_salt_names( $salts ) );
+	}
+
+	public function test_flags_two_identical_salts() {
+		$salts = array(
+			'AUTH_KEY'  => 'same-value-same-value-same-value',
+			'AUTH_SALT' => 'same-value-same-value-same-value',
+		);
+		$result = IS_Hardening::duplicate_salt_names( $salts );
+		$this->assertContains( 'AUTH_KEY', $result );
+		$this->assertContains( 'AUTH_SALT', $result );
+		$this->assertCount( 2, $result );
+	}
+
+	public function test_ignores_empty_or_non_string_values() {
+		$salts = array(
+			'AUTH_KEY'  => '',
+			'AUTH_SALT' => null,
+		);
+		$this->assertSame( array(), IS_Hardening::duplicate_salt_names( $salts ) );
+	}
+
+	public function test_three_way_duplicate_lists_all_three_once() {
+		$salts = array(
+			'AUTH_KEY'        => 'dupe',
+			'AUTH_SALT'       => 'dupe',
+			'SECURE_AUTH_KEY' => 'dupe',
+			'NONCE_KEY'       => 'unique',
+		);
+		$result = IS_Hardening::duplicate_salt_names( $salts );
+		sort( $result );
+		$this->assertSame( array( 'AUTH_KEY', 'AUTH_SALT', 'SECURE_AUTH_KEY' ), $result );
+	}
+
+	// ---- options_with_plaintext_secrets -----------------------------------
+
+	public function test_flags_an_option_with_a_non_empty_api_key() {
+		$all = array( 'is_vulnerability_scanner_settings' => array( 'api_key' => 'abc123' ) );
+		$this->assertSame( array( 'is_vulnerability_scanner_settings' ), IS_Hardening::options_with_plaintext_secrets( $all ) );
+	}
+
+	public function test_ignores_an_option_with_no_secret_configured() {
+		$all = array( 'is_vulnerability_scanner_settings' => array( 'api_key' => '' ) );
+		$this->assertSame( array(), IS_Hardening::options_with_plaintext_secrets( $all ) );
+	}
+
+	public function test_flags_multiple_secret_fields_in_one_option() {
+		$all = array( 'is_threat_intel_settings' => array( 'abuseipdb_key' => 'x', 'virustotal_key' => 'y' ) );
+		$this->assertSame( array( 'is_threat_intel_settings' ), IS_Hardening::options_with_plaintext_secrets( $all ) );
+	}
+
+	public function test_flags_each_option_at_most_once() {
+		$all = array(
+			'is_vulnerability_scanner_settings' => array( 'api_key' => 'abc123' ),
+			'is_threat_intel_settings'          => array( 'abuseipdb_key' => 'x' ),
+		);
+		$this->assertSame( array( 'is_vulnerability_scanner_settings', 'is_threat_intel_settings' ), IS_Hardening::options_with_plaintext_secrets( $all ) );
+	}
+
+	// ---- is_dormant --------------------------------------------------------
+
+	const DAY = 86400;
+
+	public function test_no_last_login_data_is_never_dormant() {
+		$this->assertFalse( IS_Hardening::is_dormant( array(), 1000000, 180 ) );
+	}
+
+	public function test_recent_login_is_not_dormant() {
+		$last_login = array( 'time' => 1000000 - ( 10 * self::DAY ) );
+		$this->assertFalse( IS_Hardening::is_dormant( $last_login, 1000000, 180 ) );
+	}
+
+	public function test_old_login_is_dormant() {
+		$last_login = array( 'time' => 1000000 - ( 200 * self::DAY ) );
+		$this->assertTrue( IS_Hardening::is_dormant( $last_login, 1000000, 180 ) );
+	}
+
+	public function test_exactly_at_threshold_is_not_yet_dormant() {
+		$last_login = array( 'time' => 1000000 - ( 180 * self::DAY ) );
+		$this->assertFalse( IS_Hardening::is_dormant( $last_login, 1000000, 180 ) );
+	}
+
+	// ---- admin_email_domain_mismatched -------------------------------------
+
+	public function test_matching_domain_is_not_flagged() {
+		$this->assertFalse( IS_Hardening::admin_email_domain_mismatched( 'admin@example.com', 'example.com' ) );
+	}
+
+	public function test_subdomain_of_site_is_not_flagged() {
+		$this->assertFalse( IS_Hardening::admin_email_domain_mismatched( 'admin@mail.example.com', 'example.com' ) );
+	}
+
+	public function test_unrelated_domain_is_flagged() {
+		$this->assertTrue( IS_Hardening::admin_email_domain_mismatched( 'admin@gmail.com', 'example.com' ) );
+	}
+
+	public function test_lookalike_domain_is_flagged_not_treated_as_subdomain() {
+		// "evil-example.com" ends with "example.com" as a raw string but is
+		// NOT a subdomain of it -- must not false-negative on this.
+		$this->assertTrue( IS_Hardening::admin_email_domain_mismatched( 'admin@evil-example.com', 'example.com' ) );
+	}
+
+	public function test_malformed_email_is_not_flagged() {
+		$this->assertFalse( IS_Hardening::admin_email_domain_mismatched( 'not-an-email', 'example.com' ) );
+	}
+
+	public function test_empty_site_host_is_not_flagged() {
+		$this->assertFalse( IS_Hardening::admin_email_domain_mismatched( 'admin@example.com', '' ) );
+	}
 }

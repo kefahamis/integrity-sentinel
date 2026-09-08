@@ -3,26 +3,28 @@
  * Plugin Name:       Integrity Sentinel — Malware Scanner & Hardening Suite
  * Plugin URI:        https://example.com/integrity-sentinel
  * Description:       File-integrity scanning (core/plugin checksums, malware/webshell patterns, obfuscation detection) plus a full hardening suite: access control, login/2FA protection, HTTP/REST hardening, hotlink and AI-bot blocking, and a human-in-the-loop quarantine engine. Batched, resumable scans, a findings dashboard, email alerts, and a WP-CLI command.
- * Version:           1.17.0
+ * Version:           1.25.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Your Org
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       integrity-sentinel
+ *
+ * @package Integrity_Sentinel
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'IS_VERSION', '1.17.0' );
+define( 'IS_VERSION', '1.25.0' );
 define( 'IS_PLUGIN_FILE', __FILE__ );
 define( 'IS_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'IS_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'IS_CRON_DAILY_SCAN', 'is_daily_scan_cron' );
 define( 'IS_CRON_RESUME_SCAN', 'is_resume_scan_cron' );
-define( 'IS_DB_VERSION', '4' );
+define( 'IS_DB_VERSION', '5' );
 
 /**
  * Simple class autoloader, same rationale as the directory plugin: this
@@ -30,17 +32,40 @@ define( 'IS_DB_VERSION', '4' );
  * anywhere plain WordPress runs.
  */
 spl_autoload_register(
-	function ( $class ) {
-		if ( strpos( $class, 'IS_' ) !== 0 ) {
+	function ( $class_name ) {
+		if ( strpos( $class_name, 'IS_' ) !== 0 ) {
 			return;
 		}
-		$file = IS_PLUGIN_DIR . 'includes/class-is-' . strtolower( str_replace( '_', '-', substr( $class, 3 ) ) ) . '.php';
+		$file = IS_PLUGIN_DIR . 'includes/class-is-' . strtolower( str_replace( '_', '-', substr( $class_name, 3 ) ) ) . '.php';
 		if ( file_exists( $file ) ) {
 			require_once $file;
 		}
 	}
 );
 
+/**
+ * The one exception to "zero third-party runtime dependencies": FIDO2/
+ * WebAuthn 2FA (IS_WebAuthn) needs web-auth/webauthn-lib, vendored and
+ * committed to the repo (like a normal WP plugin ships its own code, no
+ * build step) rather than fetched at install time. That library's own
+ * floor is PHP 8.2 -- loaded ONLY on 8.2+, so PHP 7.4-8.1 sites are
+ * completely unaffected and never touch this file at all. Composer's
+ * generated platform_check.php guard is intentionally disabled
+ * (`platform-check: false` in composer.json) precisely so this
+ * conditional require -- not Composer's own generated guard -- is what
+ * decides whether the vendored code ever loads.
+ */
+if ( PHP_VERSION_ID >= 80200 && file_exists( IS_PLUGIN_DIR . 'vendor/autoload.php' ) ) {
+	require_once IS_PLUGIN_DIR . 'vendor/autoload.php';
+	define( 'IS_WEBAUTHN_LOADED', true );
+}
+
+/**
+ * Boots every module on 'plugins_loaded': loads the text domain, then
+ * (main site only, on multisite) instantiates the DB, cron, and every
+ * detection/hardening class, plus the admin UI and AJAX handlers when
+ * in wp-admin.
+ */
 function is_init() {
 	load_plugin_textdomain( 'integrity-sentinel', false, dirname( plugin_basename( IS_PLUGIN_FILE ) ) . '/languages' );
 
@@ -58,11 +83,20 @@ function is_init() {
 	IS_Headers::instance();
 	IS_IP_List::instance();
 	IS_Login::instance();
+	IS_Login_Design::instance();
 	IS_Upload_Guard::instance();
 	IS_Bot_Block::instance();
 	IS_Rest_API::instance();
 	IS_Rest_Posts::instance();
 	IS_2FA::instance();
+	if ( IS_WebAuthn::is_available() ) {
+		IS_WebAuthn::instance();
+	}
+	IS_Sessions::instance();
+	IS_Asset_Cloak::instance();
+	IS_Password_Policy::instance();
+	IS_Deception::instance();
+	IS_Custom_Detections::instance();
 
 	if ( is_admin() ) {
 		IS_Admin::instance();
@@ -96,13 +130,13 @@ function is_activate() {
 			array(
 				'batch_size'           => 40,
 				'alert_email'          => get_option( 'admin_email' ),
-				'alert_on_severity'    => 'high', // critical, high, medium, low
+				'alert_on_severity'    => 'high', // critical, high, medium, low.
 				'scan_uploads_for_php' => 1,
-				'max_file_size_kb'     => 2048, // skip pattern-scanning (not hashing) files bigger than this
+				'max_file_size_kb'     => 2048, // skip pattern-scanning (not hashing) files bigger than this.
 				'excluded_paths'       => "wp-content/cache\nwp-content/uploads/backup*\nwp-content/ai1wm-backups",
 				'webhook_url'          => '',
 				'deadman_days'         => 2,
-				'scan_frequency'       => 'daily', // hourly, twicedaily, daily, weekly
+				'scan_frequency'       => 'daily', // hourly, twicedaily, daily, weekly.
 			),
 			false
 		);

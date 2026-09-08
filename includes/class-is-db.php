@@ -1,4 +1,11 @@
 <?php
+/**
+ * Owns the custom tables this plugin needs (scan runs, findings, audit
+ * log, quarantine) and the queries against them.
+ *
+ * @package Integrity_Sentinel
+ */
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -12,6 +19,11 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class IS_DB {
 
+	/**
+	 * Singleton instance.
+	 *
+	 * @var self|null
+	 */
 	private static $instance = null;
 
 	/**
@@ -22,6 +34,9 @@ class IS_DB {
 	 */
 	const LOCK_TTL = 5 * MINUTE_IN_SECONDS;
 
+	/**
+	 * Returns the singleton instance, creating it on first call.
+	 */
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -29,30 +44,57 @@ class IS_DB {
 		return self::$instance;
 	}
 
+	/**
+	 * Hooks the table-version upgrade check into plugins_loaded.
+	 */
 	private function __construct() {
 		add_action( 'plugins_loaded', array( $this, 'maybe_upgrade' ) );
 	}
 
+	/**
+	 * Fully-qualified name of the scan-runs table.
+	 */
 	public function runs_table() {
 		global $wpdb;
 		return $wpdb->prefix . 'is_scan_runs';
 	}
 
+	/**
+	 * Fully-qualified name of the findings table.
+	 */
 	public function findings_table() {
 		global $wpdb;
 		return $wpdb->prefix . 'is_findings';
 	}
 
+	/**
+	 * Fully-qualified name of the audit-log table.
+	 */
 	public function audit_table() {
 		global $wpdb;
 		return $wpdb->prefix . 'is_audit_log';
 	}
 
+	/**
+	 * Fully-qualified name of the quarantine table.
+	 */
 	public function quarantine_table() {
 		global $wpdb;
 		return $wpdb->prefix . 'is_quarantine';
 	}
 
+	/**
+	 * Fully-qualified name of the file-hashes table (used by the ransomware/mass-defacement velocity check).
+	 */
+	public function file_hashes_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'is_file_hashes';
+	}
+
+	/**
+	 * Creates/updates the custom tables when the stored schema version
+	 * doesn't match IS_DB_VERSION.
+	 */
 	public function maybe_upgrade() {
 		if ( get_option( 'is_db_version' ) !== IS_DB_VERSION ) {
 			$this->create_tables();
@@ -60,15 +102,19 @@ class IS_DB {
 		}
 	}
 
+	/**
+	 * Creates (or updates, via dbDelta) all five custom tables.
+	 */
 	public function create_tables() {
 		global $wpdb;
 		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 
-		$charset_collate  = $wpdb->get_charset_collate();
-		$runs_table       = $this->runs_table();
-		$findings_table   = $this->findings_table();
-		$audit_table      = $this->audit_table();
-		$quarantine_table = $this->quarantine_table();
+		$charset_collate   = $wpdb->get_charset_collate();
+		$runs_table        = $this->runs_table();
+		$findings_table    = $this->findings_table();
+		$audit_table       = $this->audit_table();
+		$quarantine_table  = $this->quarantine_table();
+		$file_hashes_table = $this->file_hashes_table();
 
 		$sql = "CREATE TABLE {$runs_table} (
 			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -83,6 +129,12 @@ class IS_DB {
 			findings_new INT UNSIGNED NOT NULL DEFAULT 0,
 			cursor_data LONGTEXT NULL,
 			error_message TEXT NULL,
+			velocity_uploads_changed INT UNSIGNED NOT NULL DEFAULT 0,
+			velocity_uploads_total INT UNSIGNED NOT NULL DEFAULT 0,
+			velocity_themes_changed INT UNSIGNED NOT NULL DEFAULT 0,
+			velocity_themes_total INT UNSIGNED NOT NULL DEFAULT 0,
+			velocity_mu_plugins_changed INT UNSIGNED NOT NULL DEFAULT 0,
+			velocity_mu_plugins_total INT UNSIGNED NOT NULL DEFAULT 0,
 			PRIMARY KEY  (id),
 			KEY status (status)
 		) {$charset_collate};
@@ -136,6 +188,15 @@ class IS_DB {
 			PRIMARY KEY  (id),
 			KEY status (status),
 			KEY original_path (original_path(191))
+		) {$charset_collate};
+
+		CREATE TABLE {$file_hashes_table} (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			file_path VARCHAR(500) NOT NULL,
+			hash VARCHAR(64) NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY  (id),
+			KEY file_path (file_path(191))
 		) {$charset_collate};";
 
 		dbDelta( $sql );
@@ -145,6 +206,11 @@ class IS_DB {
 	// Scan run helpers
 	// ---------------------------------------------------------------
 
+	/**
+	 * Inserts a new scan-run row with status 'running' and returns its id.
+	 *
+	 * @param string $trigger_type How the run was started (e.g. 'manual', 'cron').
+	 */
 	public function create_run( $trigger_type = 'manual' ) {
 		global $wpdb;
 		$now = current_time( 'mysql' );
@@ -161,6 +227,11 @@ class IS_DB {
 		return (int) $wpdb->insert_id;
 	}
 
+	/**
+	 * Fetches a single scan-run row by id.
+	 *
+	 * @param int $run_id Scan-run id.
+	 */
 	public function get_run( $run_id ) {
 		global $wpdb;
 		return $wpdb->get_row(
@@ -169,21 +240,37 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Fetches the most recently created scan-run row, regardless of status.
+	 */
 	public function get_latest_run() {
 		global $wpdb;
-		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name, not user input
 	}
 
+	/**
+	 * Fetches the most recent scan-run row that is currently running, if any.
+	 */
 	public function get_running_run() {
 		global $wpdb;
-		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} WHERE status = 'running' ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} WHERE status = 'running' ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name, not user input; 'running' is a hardcoded literal, not user data
 	}
 
+	/**
+	 * Fetches the most recently completed scan-run row, if any.
+	 */
 	public function get_latest_completed_run() {
 		global $wpdb;
-		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} WHERE status = 'completed' ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		return $wpdb->get_row( "SELECT * FROM {$this->runs_table()} WHERE status = 'completed' ORDER BY id DESC LIMIT 1", ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name, not user input; 'completed' is a hardcoded literal, not user data
 	}
 
+	/**
+	 * Updates arbitrary columns on a scan-run row, inferring %d/%s formats
+	 * from each value's PHP type.
+	 *
+	 * @param int   $run_id Scan-run id.
+	 * @param array $fields Column => value pairs to update.
+	 */
 	public function update_run( $run_id, array $fields ) {
 		global $wpdb;
 		$formats = array();
@@ -198,12 +285,19 @@ class IS_DB {
 	 * only ever read afterwards. The moving parts (offset, counters) live
 	 * in their own small columns -- rewriting a multi-megabyte JSON blob
 	 * after every batch was the old design's biggest scaling problem.
+	 *
+	 * @param int   $run_id Scan-run id.
+	 * @param array $files  Flat list of relative file paths for this run.
 	 */
 	public function set_run_files( $run_id, array $files ) {
 		$this->update_run( $run_id, array( 'cursor_data' => wp_json_encode( $files ) ) );
 	}
 
 	/**
+	 * Reads back the file list stored by set_run_files(), tolerating the
+	 * older v1 cursor shape.
+	 *
+	 * @param int $run_id Scan-run id.
 	 * @return array|null Flat list of relative paths, or null if missing/corrupt.
 	 */
 	public function get_run_files( $run_id ) {
@@ -227,6 +321,10 @@ class IS_DB {
 	 * count. findings_new is incremented in SQL (not read-modify-write in
 	 * PHP) so two processes briefly overlapping can't lose each other's
 	 * updates.
+	 *
+	 * @param int $run_id         Scan-run id.
+	 * @param int $offset         New cursor offset / files-scanned count.
+	 * @param int $findings_delta New findings to add to the running total.
 	 */
 	public function advance_run( $run_id, $offset, $findings_delta = 0 ) {
 		global $wpdb;
@@ -242,6 +340,49 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Maps a ransomware-canary scope name to its (changed, total) column pair on the runs table.
+	 *
+	 * @var array<string,string[]>
+	 */
+	const VELOCITY_SCOPE_COLUMNS = array(
+		'uploads'    => array( 'velocity_uploads_changed', 'velocity_uploads_total' ),
+		'themes'     => array( 'velocity_themes_changed', 'velocity_themes_total' ),
+		'mu_plugins' => array( 'velocity_mu_plugins_changed', 'velocity_mu_plugins_total' ),
+	);
+
+	/**
+	 * Atomically increments one scope's changed/total file counters for the
+	 * ransomware/mass-defacement velocity check, in SQL (not read-modify-
+	 * write in PHP) for the same reason advance_run() does its findings_new
+	 * increment in SQL -- concurrent batches can't lose each other's counts.
+	 *
+	 * @param int    $run_id        Scan-run id.
+	 * @param string $scope         One of the keys in VELOCITY_SCOPE_COLUMNS.
+	 * @param bool   $file_changed  Whether this file's hash differed from its previously-stored hash.
+	 */
+	public function increment_velocity_counters( $run_id, $scope, $file_changed ) {
+		if ( ! isset( self::VELOCITY_SCOPE_COLUMNS[ $scope ] ) ) {
+			return;
+		}
+		global $wpdb;
+		list( $changed_col, $total_col ) = self::VELOCITY_SCOPE_COLUMNS[ $scope ];
+		$changed_delta                   = $file_changed ? 1 : 0;
+		$wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$this->runs_table()} SET {$changed_col} = {$changed_col} + %d, {$total_col} = {$total_col} + 1 WHERE id = %d", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- column names come from the fixed VELOCITY_SCOPE_COLUMNS whitelist above, never user input
+				$changed_delta,
+				$run_id
+			)
+		);
+	}
+
+	/**
+	 * Atomically adds $delta to a run's findings_new counter.
+	 *
+	 * @param int $run_id Scan-run id.
+	 * @param int $delta  Amount to add to the running total.
+	 */
 	public function increment_findings( $run_id, $delta ) {
 		global $wpdb;
 		$wpdb->query(
@@ -264,6 +405,8 @@ class IS_DB {
 	 * fails if the row exists, which makes acquisition effectively
 	 * atomic. A stale lock (holder fataled mid-batch) is stolen after
 	 * LOCK_TTL rather than blocking the scan forever.
+	 *
+	 * @param int $run_id Scan-run id.
 	 */
 	public function acquire_scan_lock( $run_id ) {
 		$name = 'is_scan_lock_' . (int) $run_id;
@@ -282,6 +425,11 @@ class IS_DB {
 		return false;
 	}
 
+	/**
+	 * Releases the advisory batch lock for a run.
+	 *
+	 * @param int $run_id Scan-run id.
+	 */
 	public function release_scan_lock( $run_id ) {
 		delete_option( 'is_scan_lock_' . (int) $run_id );
 	}
@@ -302,6 +450,9 @@ class IS_DB {
 	 * 'ignored' from its WHERE clause entirely. If the content HAS
 	 * changed since it was ignored, that's a legitimate reason for
 	 * fresh eyes, so a new row is correct in that case.
+	 *
+	 * @param array $existing Existing finding row from the database.
+	 * @param array $incoming Freshly-matched finding data about to be recorded.
 	 */
 	public static function should_reuse_existing_finding( array $existing, array $incoming ) {
 		if ( ! in_array( $existing['status'] ?? '', array( 'new', 'acknowledged', 'ignored' ), true ) ) {
@@ -314,7 +465,7 @@ class IS_DB {
 		$existing_hash = (string) ( $existing['file_hash'] ?? '' );
 		$incoming_hash = (string) ( $incoming['file_hash'] ?? '' );
 		if ( '' === $existing_hash || '' === $incoming_hash ) {
-			return true; // no hash to compare (e.g. hardening findings) -- treat as unchanged
+			return true; // No hash to compare (e.g. hardening findings) -- treat as unchanged.
 		}
 		return $existing_hash === $incoming_hash;
 	}
@@ -327,6 +478,9 @@ class IS_DB {
 	 * "still-relevant"). rule_id is part of the identity so two
 	 * different heuristic rules matching the same file stay two separate
 	 * findings rather than overwriting each other.
+	 *
+	 * @param int   $run_id  Scan-run id this finding was matched during.
+	 * @param array $finding Finding data (file_path, issue_type, severity, etc.).
 	 */
 	public function record_finding( $run_id, array $finding ) {
 		global $wpdb;
@@ -394,6 +548,9 @@ class IS_DB {
 	 * run are auto-resolved (the underlying issue is gone -- file fixed,
 	 * restored, or deleted). Must only be called after *every* check in
 	 * the run (file pass AND checksum passes) has recorded its findings.
+	 *
+	 * @param int    $run_id                 Scan-run id (unused directly; kept for call-site clarity).
+	 * @param string $current_run_started_at MySQL datetime the current run started; findings last seen before this are stale.
 	 */
 	public function auto_resolve_stale_findings( $run_id, $current_run_started_at ) {
 		global $wpdb;
@@ -406,6 +563,103 @@ class IS_DB {
 		);
 	}
 
+	// ---------------------------------------------------------------
+	// File-hash helpers (ransomware/mass-defacement velocity check)
+	// ---------------------------------------------------------------
+
+	/**
+	 * Compares $hash against the stored hash for $file_path (if any),
+	 * then upserts the new hash. Uniqueness of file_path is enforced
+	 * here at the application layer (select-then-upsert), the same way
+	 * record_finding() already handles its own VARCHAR(500) identity
+	 * column -- a prefix-keyed VARCHAR(500) can't be a true unique/
+	 * primary key in InnoDB. Callers already hold the scan batch lock
+	 * (see acquire_scan_lock()) for the duration of a run, so this is
+	 * already effectively serialized -- no additional locking needed.
+	 *
+	 * @param string $file_path Path relative to ABSPATH.
+	 * @param string $hash      Newly-computed hash for the file.
+	 * @return array{is_new:bool,changed:bool}
+	 */
+	public function check_and_update_file_hash( $file_path, $hash ) {
+		global $wpdb;
+		$table = $this->file_hashes_table();
+		$now   = current_time( 'mysql' );
+
+		$existing = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT id, hash FROM {$table} WHERE file_path = %s LIMIT 1", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$file_path
+			),
+			ARRAY_A
+		);
+
+		if ( $existing ) {
+			$changed = ( (string) $existing['hash'] !== (string) $hash );
+			$wpdb->update(
+				$table,
+				array(
+					'hash'       => $hash,
+					'updated_at' => $now,
+				),
+				array( 'id' => $existing['id'] ),
+				array( '%s', '%s' ),
+				array( '%d' )
+			);
+			return array(
+				'is_new'  => false,
+				'changed' => $changed,
+			);
+		}
+
+		$wpdb->insert(
+			$table,
+			array(
+				'file_path'  => $file_path,
+				'hash'       => $hash,
+				'updated_at' => $now,
+			),
+			array( '%s', '%s', '%s' )
+		);
+		return array(
+			'is_new'  => true,
+			'changed' => false,
+		);
+	}
+
+	/**
+	 * Removes file-hash rows under any of $scope_prefixes that weren't
+	 * touched by the run that started at $run_started_at -- the file was
+	 * deleted (or moved out of scope) since the last time it was seen.
+	 * Mirrors auto_resolve_stale_findings()'s staleness pattern.
+	 *
+	 * @param string[] $scope_prefixes Relative-path prefixes (e.g. 'wp-content/uploads/') to prune within.
+	 * @param string   $run_started_at MySQL datetime the current run started.
+	 */
+	public function prune_stale_file_hashes( array $scope_prefixes, $run_started_at ) {
+		global $wpdb;
+		$table = $this->file_hashes_table();
+		foreach ( $scope_prefixes as $prefix ) {
+			$prefix = (string) $prefix;
+			if ( '' === $prefix ) {
+				continue;
+			}
+			$wpdb->query(
+				$wpdb->prepare(
+					"DELETE FROM {$table} WHERE file_path LIKE %s AND updated_at < %s", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+					$wpdb->esc_like( $prefix ) . '%',
+					$run_started_at
+				)
+			);
+		}
+	}
+
+	/**
+	 * Paginated, filterable list of findings, ordered by severity then
+	 * most-recently-seen.
+	 *
+	 * @param array $args Optional filters: status, severity, search, limit, offset.
+	 */
 	public function get_findings( array $args = array() ) {
 		global $wpdb;
 		$table  = $this->findings_table();
@@ -432,9 +686,14 @@ class IS_DB {
 		$params[] = $limit;
 		$params[] = $offset;
 
-		return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		return $wpdb->get_results( $wpdb->prepare( $sql, $params ), ARRAY_A ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- $sql is passed through $wpdb->prepare() with an array of args on the line above; the sniff can't see past the intermediate $sql variable
 	}
 
+	/**
+	 * Count of findings matching the same filters as get_findings().
+	 *
+	 * @param array $args Optional filters: status, severity.
+	 */
 	public function count_findings( array $args = array() ) {
 		global $wpdb;
 		$table  = $this->findings_table();
@@ -452,11 +711,16 @@ class IS_DB {
 
 		$sql = "SELECT COUNT(*) FROM {$table} WHERE " . implode( ' AND ', $where );
 		if ( $params ) {
-			return (int) $wpdb->get_var( $wpdb->prepare( $sql, $params ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			return (int) $wpdb->get_var( $wpdb->prepare( $sql, $params ) ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- $sql is passed through $wpdb->prepare() with an array of args on this same line; the sniff can't see past the intermediate $sql variable
 		}
-		return (int) $wpdb->get_var( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery
+		return (int) $wpdb->get_var( $sql ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery -- no $params to bind (the WHERE clause is empty here), and the only interpolated value is the table name
 	}
 
+	/**
+	 * Findings count per severity, filtered by status.
+	 *
+	 * @param string $status Finding status to filter by.
+	 */
 	public function severity_counts( $status = 'new' ) {
 		global $wpdb;
 		$table = $this->findings_table();
@@ -471,6 +735,9 @@ class IS_DB {
 	 * Severity counts for findings that first appeared during the given
 	 * run -- what an alert email should mean by "N new issue(s)", as
 	 * opposed to every unacknowledged finding ever.
+	 *
+	 * @param int    $run_id         Scan-run id.
+	 * @param string $run_started_at MySQL datetime the run started.
 	 */
 	public function severity_counts_for_run( $run_id, $run_started_at ) {
 		global $wpdb;
@@ -486,6 +753,12 @@ class IS_DB {
 		return $this->fill_severity_counts( $rows );
 	}
 
+	/**
+	 * Merges a sparse severity=>count result set into a fixed-shape array
+	 * with every severity level present (defaulting to zero).
+	 *
+	 * @param array $rows Result rows with 'severity' and 'c' (count) keys.
+	 */
 	private function fill_severity_counts( $rows ) {
 		$counts = array(
 			'critical' => 0,
@@ -502,6 +775,11 @@ class IS_DB {
 		return $counts;
 	}
 
+	/**
+	 * Fetches a single finding row by id.
+	 *
+	 * @param int $id Finding id.
+	 */
 	public function get_finding( $id ) {
 		global $wpdb;
 		return $wpdb->get_row(
@@ -510,6 +788,12 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Updates a finding's status.
+	 *
+	 * @param int    $id     Finding id.
+	 * @param string $status New status.
+	 */
 	public function set_finding_status( $id, $status ) {
 		global $wpdb;
 		$wpdb->update( $this->findings_table(), array( 'status' => $status ), array( 'id' => $id ), array( '%s' ), array( '%d' ) );
@@ -519,6 +803,11 @@ class IS_DB {
 	// Quarantine
 	// ---------------------------------------------------------------
 
+	/**
+	 * Inserts a new quarantine record and returns its id.
+	 *
+	 * @param array $record Quarantine data (original_path, quarantine_path, etc.).
+	 */
 	public function insert_quarantine_record( array $record ) {
 		global $wpdb;
 		$now = current_time( 'mysql' );
@@ -540,6 +829,11 @@ class IS_DB {
 		return (int) $wpdb->insert_id;
 	}
 
+	/**
+	 * Fetches a single quarantine record by id.
+	 *
+	 * @param int $id Quarantine record id.
+	 */
 	public function get_quarantine_item( $id ) {
 		global $wpdb;
 		return $wpdb->get_row(
@@ -548,6 +842,13 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Paginated list of quarantine records filtered by status.
+	 *
+	 * @param string $status Status to filter by.
+	 * @param int    $limit  Max rows to return.
+	 * @param int    $offset Rows to skip.
+	 */
 	public function get_quarantine_items( $status = 'quarantined', $limit = 50, $offset = 0 ) {
 		global $wpdb;
 		return $wpdb->get_results(
@@ -561,6 +862,11 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Count of quarantine records with the given status.
+	 *
+	 * @param string $status Status to filter by.
+	 */
 	public function count_quarantine_items( $status = 'quarantined' ) {
 		global $wpdb;
 		return (int) $wpdb->get_var(
@@ -568,6 +874,13 @@ class IS_DB {
 		);
 	}
 
+	/**
+	 * Updates a quarantine record's status and review metadata.
+	 *
+	 * @param int    $id          Quarantine record id.
+	 * @param string $status      New status.
+	 * @param int    $reviewed_by User id of the reviewer.
+	 */
 	public function set_quarantine_status( $id, $status, $reviewed_by ) {
 		global $wpdb;
 		$wpdb->update(

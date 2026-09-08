@@ -1,4 +1,11 @@
 <?php
+/**
+ * TOTP-based two-factor authentication, with per-user opt-in and optional
+ * per-role enforcement, login-time verification, and single-use recovery codes.
+ *
+ * @package Integrity_Sentinel
+ */
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -23,12 +30,20 @@ if ( ! defined( 'ABSPATH' ) ) {
  */
 class IS_2FA {
 
+	/**
+	 * Singleton instance.
+	 *
+	 * @var self|null
+	 */
 	private static $instance = null;
 
 	const PENDING_TTL         = 10 * MINUTE_IN_SECONDS;
 	const MAX_CODE_ATTEMPTS   = 5;
 	const RECOVERY_CODE_COUNT = 8;
 
+	/**
+	 * Returns the singleton instance, creating and hooking it up on first call.
+	 */
 	public static function instance() {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
@@ -37,14 +52,24 @@ class IS_2FA {
 		return self::$instance;
 	}
 
+	/**
+	 * Default settings, used to fill in anything missing from the stored option.
+	 */
 	public static function default_settings() {
 		return array( 'enforced_roles' => array() );
 	}
 
+	/**
+	 * Stored settings, merged over default_settings().
+	 */
 	public static function settings() {
 		return wp_parse_args( get_option( 'is_2fa_settings', array() ), self::default_settings() );
 	}
 
+	/**
+	 * Registers the WordPress hooks that drive setup, login-time
+	 * verification, profile-screen UI, and role-based enforcement.
+	 */
 	private function hooks() {
 		add_filter( 'authenticate', array( $this, 'maybe_intercept_login' ), 40 );
 		add_action( 'login_form_is_2fa', array( $this, 'handle_verify_screen' ) );
@@ -61,11 +86,22 @@ class IS_2FA {
 	// Pure logic
 	// ===================================================================
 
+	/**
+	 * Pure: hashes a recovery code (after normalizing it) for storage/comparison.
+	 *
+	 * @param string $code Recovery code, in whatever formatting the user typed.
+	 * @return string SHA-256 hash of the normalized code.
+	 */
 	public static function hash_recovery_code( $code ) {
 		return hash( 'sha256', self::normalize_recovery_code( $code ) );
 	}
 
-	/** Pure: strips everything but alphanumerics and uppercases, so "ab12-cd34" and "AB12CD34" match. */
+	/**
+	 * Pure: strips everything but alphanumerics and uppercases, so "ab12-cd34" and "AB12CD34" match.
+	 *
+	 * @param string $code Recovery code, in whatever formatting the user typed.
+	 * @return string Normalized code.
+	 */
 	public static function normalize_recovery_code( $code ) {
 		return strtoupper( preg_replace( '/[^A-Za-z0-9]/', '', (string) $code ) );
 	}
@@ -75,7 +111,8 @@ class IS_2FA {
 	 * and returns the remaining hash list with it removed (single-use).
 	 * Constant-time comparison per candidate.
 	 *
-	 * @param string[] $hashed_codes
+	 * @param string[] $hashed_codes   Stored recovery-code hashes to check against.
+	 * @param string   $submitted_code Recovery code submitted by the user, unhashed.
 	 * @return array{matched: bool, remaining: string[]}
 	 */
 	public static function consume_recovery_code( array $hashed_codes, $submitted_code ) {
@@ -96,6 +133,13 @@ class IS_2FA {
 		);
 	}
 
+	/**
+	 * Pure: whether any of the user's roles are in the enforced-roles list.
+	 *
+	 * @param string[] $user_roles     Roles assigned to the user.
+	 * @param string[] $enforced_roles Roles for which 2FA is enforced.
+	 * @return bool
+	 */
 	public static function role_requires_2fa( array $user_roles, array $enforced_roles ) {
 		return (bool) array_intersect( $user_roles, $enforced_roles );
 	}
@@ -104,20 +148,60 @@ class IS_2FA {
 	// WP-dependent glue: per-user state
 	// ===================================================================
 
+	/**
+	 * Whether 2FA is enabled (fully set up and confirmed) for the given user.
+	 *
+	 * @param int $user_id User ID.
+	 * @return bool
+	 */
 	public static function is_enabled( $user_id ) {
 		return '1' === get_user_meta( $user_id, '_is_2fa_enabled', true );
 	}
 
+	/**
+	 * Whether the user has ANY second factor set up -- TOTP, or (when
+	 * available) WebAuthn credentials. Used everywhere "does this user
+	 * already have 2FA" matters (login interception, enforcement
+	 * nudging), so a WebAuthn-only user is treated exactly the same as
+	 * a TOTP-only user rather than being silently unprotected.
+	 *
+	 * @param int $user_id User ID.
+	 */
+	public static function any_method_enabled( $user_id ) {
+		if ( self::is_enabled( $user_id ) ) {
+			return true;
+		}
+		return class_exists( 'IS_WebAuthn' ) && IS_WebAuthn::is_available() && IS_WebAuthn::has_credentials( $user_id );
+	}
+
+	/**
+	 * The user's stored TOTP secret, or an empty string if none is set.
+	 *
+	 * @param int $user_id User ID.
+	 * @return string
+	 */
 	public static function secret( $user_id ) {
 		return (string) get_user_meta( $user_id, '_is_2fa_secret', true );
 	}
 
+	/**
+	 * The user's stored recovery-code hashes.
+	 *
+	 * @param int $user_id User ID.
+	 * @return string[]
+	 */
 	public static function recovery_hashes( $user_id ) {
 		$stored = get_user_meta( $user_id, '_is_2fa_recovery_codes', true );
 		return is_array( $stored ) ? $stored : array();
 	}
 
-	/** @return string[] Plaintext codes -- shown to the user exactly once. */
+	/**
+	 * Generates a fresh batch of recovery codes, stores their hashes
+	 * (replacing any existing ones), and returns the plaintext codes.
+	 *
+	 * @param int $user_id User ID.
+	 * @return string[] Plaintext codes -- shown to the user exactly once.
+	 */
 	public static function generate_recovery_codes( $user_id ) {
 		$plain  = array();
 		$hashed = array();
@@ -134,6 +218,12 @@ class IS_2FA {
 	// Setup flow (admin-post, from the user's own profile screen)
 	// ===================================================================
 
+	/**
+	 * Confirms the current user is acting on their own account and that the
+	 * request carries a valid nonce, dying with an error otherwise.
+	 *
+	 * @param int $target_user_id User ID the action is being performed on.
+	 */
 	private function guard_own_profile_action( $target_user_id ) {
 		if ( get_current_user_id() !== (int) $target_user_id || ! current_user_can( 'read' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'integrity-sentinel' ) );
@@ -160,7 +250,7 @@ class IS_2FA {
 		$this->guard_own_profile_action( $user_id );
 
 		$secret = get_transient( 'is_2fa_setup_' . $user_id );
-		$code   = isset( $_POST['is_2fa_code'] ) ? sanitize_text_field( wp_unslash( $_POST['is_2fa_code'] ) ) : '';
+		$code   = isset( $_POST['is_2fa_code'] ) ? sanitize_text_field( wp_unslash( $_POST['is_2fa_code'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above via guard_own_profile_action() -> check_admin_referer( 'is_2fa_action' )
 
 		$redirect = get_edit_profile_url( $user_id ) . '#is-2fa';
 
@@ -174,7 +264,7 @@ class IS_2FA {
 		delete_transient( 'is_2fa_setup_' . $user_id );
 
 		$codes = self::generate_recovery_codes( $user_id );
-		set_transient( 'is_2fa_recovery_display_' . $user_id, $codes, MINUTE_IN_SECONDS ); // shown exactly once, right after this redirect
+		set_transient( 'is_2fa_recovery_display_' . $user_id, $codes, MINUTE_IN_SECONDS ); // shown exactly once, right after this redirect.
 
 		IS_Audit_Log::record( '2fa_enabled', array( 'user_id' => $user_id ) );
 		IS_Notifications::instance()->send_event(
@@ -193,6 +283,10 @@ class IS_2FA {
 		exit;
 	}
 
+	/**
+	 * Disables 2FA for the current user: clears the enabled flag, secret,
+	 * and recovery codes, and notifies of the change.
+	 */
 	public function handle_disable() {
 		$user_id = get_current_user_id();
 		$this->guard_own_profile_action( $user_id );
@@ -218,6 +312,10 @@ class IS_2FA {
 		exit;
 	}
 
+	/**
+	 * Regenerates the current user's recovery codes, invalidating the old
+	 * ones, provided 2FA is already enabled for them.
+	 */
 	public function handle_regenerate_recovery() {
 		$user_id = get_current_user_id();
 		$this->guard_own_profile_action( $user_id );
@@ -239,16 +337,23 @@ class IS_2FA {
 	// Profile screen UI
 	// ===================================================================
 
+	/**
+	 * Renders the 2FA section on the user's own profile screen: current
+	 * status, setup/confirm/disable/regenerate controls, and (once) any
+	 * freshly generated recovery codes.
+	 *
+	 * @param WP_User $user Profile-screen user being rendered.
+	 */
 	public function render_profile_section( $user ) {
 		if ( get_current_user_id() !== (int) $user->ID ) {
-			return; // setup is self-service only -- an admin can't set up 2FA on someone else's behalf
+			return; // setup is self-service only -- an admin can't set up 2FA on someone else's behalf.
 		}
 		$enabled       = self::is_enabled( $user->ID );
 		$pending       = get_transient( 'is_2fa_setup_' . $user->ID );
 		$show_error    = isset( $_GET['is_2fa_error'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- display-only flag from our own redirect
 		$show_recovery = get_transient( 'is_2fa_recovery_display_' . $user->ID );
 		if ( $show_recovery ) {
-			delete_transient( 'is_2fa_recovery_display_' . $user->ID ); // shown exactly once
+			delete_transient( 'is_2fa_recovery_display_' . $user->ID ); // shown exactly once.
 		}
 		?>
 		<h2 id="is-2fa"><?php esc_html_e( 'Two-Factor Authentication', 'integrity-sentinel' ); ?></h2>
@@ -305,6 +410,9 @@ class IS_2FA {
 			</tr>
 		</table>
 		<?php
+		if ( class_exists( 'IS_WebAuthn' ) && IS_WebAuthn::is_available() ) {
+			IS_WebAuthn::instance()->render_profile_section( $user );
+		}
 	}
 
 	/**
@@ -329,7 +437,7 @@ class IS_2FA {
 				}
 
 				$user = wp_get_current_user();
-				if ( ! $user || ! $user->ID || self::is_enabled( $user->ID ) ) {
+				if ( ! $user || ! $user->ID || self::any_method_enabled( $user->ID ) ) {
 					return;
 				}
 				if ( ! self::role_requires_2fa( (array) $user->roles, self::settings()['enforced_roles'] ) ) {
@@ -346,15 +454,62 @@ class IS_2FA {
 	// Login-time verification
 	// ===================================================================
 
-	private static function pending_key( $token ) {
+	/**
+	 * Transient key used to store pending-login state for a verification
+	 * token. Public: IS_WebAuthn shares this same pending-login state
+	 * (keyed by the same token) as an alternative verification method
+	 * alongside TOTP/recovery codes.
+	 *
+	 * @param string $token Random per-attempt token issued in maybe_intercept_login().
+	 * @return string
+	 */
+	public static function pending_key( $token ) {
 		return 'is_2fa_pending_' . $token;
 	}
 
+	/**
+	 * The pending-login state for a verification token, or false if none/expired.
+	 *
+	 * @param string $token Pending-login token.
+	 * @return array{user_id:int,remember:bool,attempts:int}|false
+	 */
+	public static function get_pending( $token ) {
+		return get_transient( self::pending_key( $token ) );
+	}
+
+	/**
+	 * Completes a verified pending login: clears the pending state, sets
+	 * the auth cookie/current user, and fires 'wp_login' -- the same
+	 * completion path regardless of which method (TOTP, recovery code,
+	 * WebAuthn) did the verifying. Callers are responsible for their own
+	 * audit-log entry (the event name differs per method) and redirect.
+	 *
+	 * @param string $token    Pending-login token, so its transient can be cleared.
+	 * @param int    $user_id  Verified user ID.
+	 * @param bool   $remember Whether to set a long-lived auth cookie.
+	 */
+	public static function complete_pending_login( $token, $user_id, $remember ) {
+		delete_transient( self::pending_key( $token ) );
+		$user = get_userdata( $user_id );
+		wp_set_auth_cookie( $user_id, $remember );
+		wp_set_current_user( $user_id );
+		do_action( 'wp_login', $user->user_login, $user );
+	}
+
+	/**
+	 * Hooked to 'authenticate': if the authenticated user has 2FA enabled,
+	 * stashes the pending login (user, "remember me", attempt count) behind
+	 * a random token and redirects to the code-verification screen instead
+	 * of letting the login complete.
+	 *
+	 * @param WP_User|WP_Error|null $user User (or error) from an earlier authenticate callback.
+	 * @return WP_User|WP_Error|null Unchanged $user when no interception is needed.
+	 */
 	public function maybe_intercept_login( $user ) {
 		return IS_Guard::run(
 			'2fa_login',
 			function () use ( $user ) {
-				if ( ! ( $user instanceof WP_User ) || ! self::is_enabled( $user->ID ) ) {
+				if ( ! ( $user instanceof WP_User ) || ! self::any_method_enabled( $user->ID ) ) {
 					return $user;
 				}
 
@@ -363,13 +518,13 @@ class IS_2FA {
 					self::pending_key( $token ),
 					array(
 						'user_id'  => $user->ID,
-						'remember' => ! empty( $_POST['rememberme'] ), // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- mirrors wp-login.php's own unauthenticated handling of this field
+						'remember' => ! empty( $_POST['rememberme'] ), // phpcs:ignore WordPress.Security.NonceVerification.Missing -- mirrors wp-login.php's own unauthenticated handling of this field, before any user is logged in (no nonce is possible yet)
 						'attempts' => 0,
 					),
 					self::PENDING_TTL
 				);
 
-				$redirect_to = isset( $_REQUEST['redirect_to'] ) ? wp_unslash( $_REQUEST['redirect_to'] ) : admin_url(); // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- passed straight to wp_safe_redirect() below, which validates it
+				$redirect_to = isset( $_REQUEST['redirect_to'] ) ? wp_unslash( $_REQUEST['redirect_to'] ) : admin_url(); // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- passed straight to wp_safe_redirect() below, which validates it
 
 				wp_safe_redirect(
 					add_query_arg(
@@ -387,6 +542,12 @@ class IS_2FA {
 		);
 	}
 
+	/**
+	 * Hooked to 'login_form_is_2fa': renders the code-entry form on GET,
+	 * and on POST validates the submitted token, checks the TOTP code (or
+	 * a recovery code as a fallback), enforces the attempt limit, and on
+	 * success completes the login and redirects the user onward.
+	 */
 	public function handle_verify_screen() {
 		IS_Guard::run(
 			'2fa_login',
@@ -404,8 +565,8 @@ class IS_2FA {
 					);
 				}
 
-				if ( 'POST' !== ( $_SERVER['REQUEST_METHOD'] ?? '' ) ) {
-					$this->render_verify_form( $token, isset( $_GET['redirect_to'] ) ? wp_unslash( $_GET['redirect_to'] ) : '', false ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- display-only, echoed via esc_url() in render_verify_form()
+				if ( 'POST' !== sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ?? '' ) ) ) {
+					$this->render_verify_form( $token, (int) $pending['user_id'], isset( $_GET['redirect_to'] ) ? wp_unslash( $_GET['redirect_to'] ) : '', false ); // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- display-only, echoed via esc_url() in render_verify_form()
 					exit;
 				}
 
@@ -439,28 +600,35 @@ class IS_2FA {
 					$pending['attempts'] = (int) $pending['attempts'] + 1;
 					set_transient( self::pending_key( $token ), $pending, self::PENDING_TTL );
 					IS_Audit_Log::record( '2fa_code_rejected', array( 'user_id' => $user_id ) );
-					$this->render_verify_form( $token, isset( $_POST['redirect_to'] ) ? wp_unslash( $_POST['redirect_to'] ) : '', true ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- display-only, echoed via esc_url() in render_verify_form()
+					$this->render_verify_form( $token, $user_id, isset( $_POST['redirect_to'] ) ? wp_unslash( $_POST['redirect_to'] ) : '', true ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- display-only, echoed via esc_url() in render_verify_form()
 					exit;
 				}
 
-				delete_transient( self::pending_key( $token ) );
-
-				$user = get_userdata( $user_id );
-				wp_set_auth_cookie( $user_id, ! empty( $pending['remember'] ) );
-				wp_set_current_user( $user_id );
-				do_action( 'wp_login', $user->user_login, $user );
+				self::complete_pending_login( $token, $user_id, ! empty( $pending['remember'] ) );
 
 				IS_Audit_Log::record( '2fa_login_verified', array( 'user_id' => $user_id ) );
 
-				$redirect_to = isset( $_POST['redirect_to'] ) ? wp_unslash( $_POST['redirect_to'] ) : admin_url(); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.MissingUnslash -- passed straight to wp_safe_redirect(), which validates it
+				$redirect_to = isset( $_POST['redirect_to'] ) ? wp_unslash( $_POST['redirect_to'] ) : admin_url(); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.MissingUnslash, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- passed straight to wp_safe_redirect(), which validates it
 				wp_safe_redirect( $redirect_to );
 				exit;
 			}
 		);
 	}
 
-	private function render_verify_form( $token, $redirect_to, $show_error ) {
+	/**
+	 * Renders the standalone (wp-login.php-hosted) 2FA code-verification
+	 * form for the given pending-login token.
+	 *
+	 * @param string $token       Pending-login token, echoed back as a hidden field via the form action.
+	 * @param int    $user_id     User the pending login belongs to (so a WebAuthn challenge, if applicable, can be offered).
+	 * @param string $redirect_to Where to send the user after a successful verification.
+	 * @param bool   $show_error  Whether to display the "invalid code" error notice.
+	 */
+	private function render_verify_form( $token, $user_id, $redirect_to, $show_error ) {
 		login_header( __( 'Verification', 'integrity-sentinel' ), '', $show_error ? new WP_Error( 'is_2fa_invalid', __( 'Invalid code. Please try again.', 'integrity-sentinel' ) ) : '' );
+		if ( class_exists( 'IS_WebAuthn' ) && IS_WebAuthn::is_available() && IS_WebAuthn::has_credentials( $user_id ) ) {
+			IS_WebAuthn::instance()->render_login_challenge_button( $token, $redirect_to );
+		}
 		?>
 		<form name="is_2fa_form" method="post" action="
 		<?php
